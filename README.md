@@ -128,3 +128,200 @@ Les différents indicateurs de conformité sont conservés séparément afin de 
 | code_departement | string | Code département |
 | code_commune | string | Code commune |
 | reference_analyse | string | Identifiant d’analyse |
+
+
+## Bronze layer
+### Vues
+Créé des vues aggrégées pour la BI
+- vue evolution des resultats dans le temps
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_time_series AS
+SELECT
+  date_trunc('day', date_prelevement) AS jour,
+  parametre,
+  AVG(resultat_numerique) AS moyenne,
+  MIN(resultat_numerique) AS min_val,
+  MAX(resultat_numerique) AS max_val,
+  COUNT(*) AS nb_mesures
+FROM main.silver.qualite_eau
+WHERE resultat_numerique IS NOT NULL
+GROUP BY date_trunc('day', date_prelevement), parametre
+""")
+```
+- vue nombre de mesures
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_parametre_stats AS
+SELECT
+  parametre,
+  COUNT(*) AS nb_mesures,
+  AVG(resultat_numerique) AS moyenne,
+  MIN(resultat_numerique) AS min_val,
+  MAX(resultat_numerique) AS max_val
+FROM main.silver.qualite_eau
+WHERE resultat_numerique IS NOT NULL
+GROUP BY parametre
+""")
+```
+- vue qualité du reseau
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_reseau_quality AS
+SELECT
+  reseau_nom,
+  COUNT(*) AS nb_mesures,
+  SUM(CASE WHEN upper(conformite_limites_pc_prelevement) = 'NC' THEN 1 ELSE 0 END) AS nc_pc,
+  SUM(CASE WHEN upper(conformite_limites_bact_prelevement) = 'NC' THEN 1 ELSE 0 END) AS nc_bact
+FROM main.silver.qualite_eau
+GROUP BY reseau_nom
+""")
+```
+- depassement des limites
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_depassements AS
+WITH base AS (
+  SELECT
+    date_prelevement,
+    commune,
+    parametre,
+    resultat_numerique,
+
+    try_cast(
+      regexp_replace(
+        regexp_replace(limite_qualite_parametre, ',', '.'),
+        '[^0-9.]',
+        ''
+      ) AS double
+    ) AS limite_numerique
+
+  FROM main.silver.qualite_eau
+  WHERE resultat_numerique IS NOT NULL
+)
+
+SELECT
+  date_prelevement,
+  commune,
+  parametre,
+  resultat_numerique,
+  limite_numerique,
+  CASE
+    WHEN limite_numerique IS NOT NULL
+     AND resultat_numerique > limite_numerique
+    THEN 1 ELSE 0
+  END AS depassement
+FROM base
+""")
+```
+- vue qualité par commune
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_commune_quality AS
+SELECT
+  commune,
+  COUNT(*) AS nb_mesures,
+  AVG(resultat_numerique) AS moyenne,
+  MIN(resultat_numerique) AS min_val,
+  MAX(resultat_numerique) AS max_val
+FROM main.silver.qualite_eau
+GROUP BY commune
+""")
+```
+- vue top anomalies
+```
+spark.sql("""
+CREATE OR REPLACE VIEW main.gold.v_top_anomalies AS
+SELECT
+  date_prelevement,
+  commune,
+  parametre,
+  resultat_numerique,
+  limite_qualite_parametre
+FROM main.silver.qualite_eau
+WHERE resultat_numerique IS NOT NULL
+ORDER BY resultat_numerique DESC
+""")
+```
+
+### Great expectations
+- installer great expectation (version compatible databricks)
+```
+%pip install great-expectations==0.18.21
+```
+
+- enlever les colonnes void (eviter le plantage spark)
+```
+void_cols = [c for c, t in df.dtypes if "void" in t.lower()]
+df = df.drop(*void_cols)
+```
+- creer un df pandas 
+```
+pdf = df.limit(10000).toPandas()
+```
+- creer un df great Xpectations
+```
+gx_df = gx.from_pandas(pdf)
+```
+- check le nombre de colonnes superieur a 1
+```
+gx_df.expect_table_row_count_to_be_between(min_value=1)
+```
+voir si les colones d'enrichissement sont bien presente
+```
+gx_df.expect_column_to_exist("code_prelevement")
+gx_df.expect_column_to_exist("hash")
+gx_df.expect_column_to_exist("date_prelevement")
+```
+- verifier si le code du hash est bien effectif
+```
+gx_df.expect_column_values_to_not_be_null("hash")
+gx_df.expect_column_values_to_be_unique("hash")
+```
+- check des nulls
+```
+gx_df.expect_column_values_to_not_be_null("libelle_parametre")
+gx_df.expect_column_values_to_not_be_null("nom_commune")
+```
+- check si le code departement est correct
+```
+gx_df.expect_column_values_to_match_regex(
+    "code_departement",
+    r"^\d{2,3}$"
+)
+```
+- check si le code commune est conforme
+```
+gx_df.expect_column_values_to_match_regex(
+    "code_commune",
+    r"^\d{5}$"
+)
+```
+- check si l'année est bonne (entre 2000 et 2030)
+```
+gx_df.expect_column_values_to_be_between(
+    "annee",
+    min_value=2000,
+    max_value=2030
+)
+```
+- lancer les test
+```
+results = gx_df.validate()
+```
+
+### Deployement
+#### Action workflow
+- Checkout (recuperer le code)
+- Install (databricks cli)
+- Deploy le bundle (lancer la commande pour creer les jobs databricks via databricks.yml) en s'appuyant sur les secrets github suivants : 
+    - databricks_host: (l'url de l'environnement databricks)
+    - databricks_token : (le token d'acces a l'env databricks)
+#### databricks.yml
+permet de configurer le bundle databricks
+- nommer le bundle ave bundle.name
+- declarer un job databricks (resources.jobs.xx)
+- creer une tache 
+    - creer un cluster (spark_version, node_type_id, num_workers)
+    - lancer le script python(hello.py)
+- targets.dev.workspace : (host / root_path)
