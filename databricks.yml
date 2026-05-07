@@ -1,0 +1,21 @@
+bundle:
+  name: projet_dlt_yferdin_git
+
+resources:
+  jobs:
+    hello_world_job:
+      name: "Job_Hello_World_YF"
+      tasks:
+        - task_key: hello_task
+          new_cluster:
+            spark_version: "13.3.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 1
+          spark_python_task:
+            python_file: ./hello_world.py
+
+targets:
+  dev:
+    workspace:
+      host: https://adb-7405614618199002.2.azuredatabricks.net
+      root_path: /Workspace/Users/yferdin.ext@simplonformations.co/tests/bundle_test
